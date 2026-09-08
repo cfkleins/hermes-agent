@@ -47,7 +47,7 @@ def _require_private_acl(path: Path) -> None:
     """Read-only conservative permission check; never repair existing ACLs."""
     if os.name != "nt":
         info = path.stat()
-        if info.st_uid != os.getuid() or info.st_mode & 0o077:
+        if info.st_uid != os.getuid() or info.st_mode & 0o077:  # windows-footgun: ok
             raise CredentialBlocked("unsafe_permissions")
         return
     import win32api

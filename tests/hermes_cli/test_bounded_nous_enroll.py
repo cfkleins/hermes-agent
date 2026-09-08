@@ -425,4 +425,3 @@ def test_status_flushes_before_browser_and_enrolled_follows_persistence(cli, sou
     action()
     assert events.index(("persisted_readback", None)) < events.index(("write", '{"status":"enrolled"}'))
     assert events[-1] == ("flush", None)
-
