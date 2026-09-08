@@ -158,3 +158,35 @@ def test_package_import_has_no_runtime_side_effects(tmp_path):
         "assert 'gateway.session' not in sys.modules"], cwd=ROOT,
         env=environment(tmp_path, home), capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stderr
+
+
+def test_provider_jwt_8192_preserved_through_native_preflight(tmp_path, monkeypatch):
+    from gateway.bounded_service import load_policy
+    path, _, home = configuration(tmp_path)
+    env = environment(tmp_path, home)
+    key = 'eyJ.' + 'A' * 8186 + '.Z'
+    env['VCC_BOUNDED_NOUS_KEY'] = key
+    monkeypatch.setenv('VCC_BOUNDED_HERMES_TOKEN', TOKEN)
+    monkeypatch.setenv('VCC_BOUNDED_NOUS_KEY', key)
+    assert load_policy(str(path)).key == key
+    result = invoke(tmp_path, path, home, env=env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout)['status'] == 'checked'
+
+
+@pytest.mark.parametrize('name,value', [
+    ('VCC_BOUNDED_HERMES_TOKEN', 'A' * 513),
+    ('VCC_BOUNDED_NOUS_KEY', 'A' * 8193),
+    ('VCC_BOUNDED_NOUS_KEY', 'A B'),
+    ('VCC_BOUNDED_NOUS_KEY', 'A,B'),
+    ('VCC_BOUNDED_NOUS_KEY', '${TOKEN}'),
+    ('VCC_BOUNDED_NOUS_KEY', 'A\u007f'),
+    ('VCC_BOUNDED_NOUS_KEY', 'A\u00e9'),
+])
+def test_secret_caps_fail_before_home_writes(tmp_path, name, value):
+    path, _, home = configuration(tmp_path)
+    env = environment(tmp_path, home)
+    env[name] = value
+    result = invoke(tmp_path, path, home, env=env)
+    assert result.returncode == 2
+    assert not home.exists()

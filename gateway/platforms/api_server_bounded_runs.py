@@ -572,6 +572,11 @@ async def handle_bounded_runs(adapter, request) -> "web.Response":
         limited = adapter._concurrency_limited_response(exclude_current_pending=True)
         if limited is not None:
             return limited
+        freshness_gate = getattr(adapter, '_new_bounded_work_response', None)
+        if freshness_gate is not None:
+            refused = freshness_gate()
+            if refused is not None:
+                return refused
         run_id = f"brun_{uuid.uuid4().hex}"
         initial_status = _initial_status(run_id, prepared)
         try:

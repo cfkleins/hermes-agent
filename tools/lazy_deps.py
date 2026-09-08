@@ -568,6 +568,9 @@ def ensure(feature: str, *, prompt: bool = True) -> None:
     """Make every package for ``feature`` importable, installing if needed; raises
     :class:`FeatureUnavailable` when installs are disabled or fail. ``prompt``: confirm on a TTY first
     (non-interactive callers pass False and rely on the config gate)."""
+    from hermes_bounded_bootstrap import active
+    if active():
+        raise FeatureUnavailable(feature, (), "runtime installs disabled in bounded service")
     if feature not in LAZY_DEPS:
         raise FeatureUnavailable(feature, (), f"feature {feature!r} not in LAZY_DEPS allowlist")
     missing = feature_missing(feature)
@@ -643,6 +646,9 @@ def install_specs(specs: list[str] | tuple[str, ...], *, timeout: int = 300) -> 
     """Install data-driven pip specs (plugin manifest ``pip_dependencies``) with the same routing and
     gating as :func:`ensure`, but unknown packages are allowed — the caller owns manifest trust, this
     owns spec hygiene. Never raises; inspect the :class:`InstallSpecsResult`."""
+    from hermes_bounded_bootstrap import active
+    if active():
+        return InstallSpecsResult(ok=False, blocked=True, reason="runtime installs disabled in bounded service")
     cleaned = tuple(str(s).strip() for s in specs if str(s).strip())
     if not cleaned:
         return InstallSpecsResult(ok=True, command="")
