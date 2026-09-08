@@ -1,16 +1,23 @@
-"""Hermes Gateway - multi-platform messaging integration (sessions, context
-injection, delivery routing, platform-specific toolsets)."""
+"""Hermes Gateway public types, loaded only when requested.
 
-from .config import GatewayConfig, PlatformConfig, HomeChannel, load_gateway_config
-from .session import (
-    SessionContext,
-    SessionStore,
-    build_session_context_prompt,
-)
-from .delivery import DeliveryRouter, DeliveryTarget
+Keep package import inert: ``python -m gateway.bounded_service`` must set its
+explicit home before any runtime/config module takes an import-time snapshot.
+"""
+from importlib import import_module
 
-__all__ = [
-    "GatewayConfig", "PlatformConfig", "HomeChannel", "load_gateway_config",
-    "SessionContext", "SessionStore", "build_session_context_prompt",
-    "DeliveryRouter", "DeliveryTarget",
-]
+_EXPORTS = {
+    'GatewayConfig': '.config', 'PlatformConfig': '.config',
+    'HomeChannel': '.config', 'load_gateway_config': '.config',
+    'SessionContext': '.session', 'SessionStore': '.session',
+    'build_session_context_prompt': '.session',
+    'DeliveryRouter': '.delivery', 'DeliveryTarget': '.delivery',
+}
+__all__ = list(_EXPORTS)
+
+
+def __getattr__(name):
+    if name not in _EXPORTS:
+        raise AttributeError(name)
+    value = getattr(import_module(_EXPORTS[name], __name__), name)
+    globals()[name] = value
+    return value

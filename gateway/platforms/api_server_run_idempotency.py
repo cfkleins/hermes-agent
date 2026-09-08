@@ -60,7 +60,9 @@ class RunIdempotencyStore:
     def durable(self) -> bool:
         """Whether reservations survive this process."""
         return self._db_path is not None
-    def __init__(self, db_path: str = None):
+    def __init__(self, db_path: str = None, *, require_durable: bool = False):
+        if require_durable and (not db_path or db_path == ":memory:"):
+            raise ValueError("Explicit durable run store required")
         if db_path is None:
             try:
                 from hermes_cli.config import get_hermes_home
@@ -71,6 +73,8 @@ class RunIdempotencyStore:
         try:
             self._conn = sqlite3.connect(db_path, check_same_thread=False, timeout=30)
         except Exception as exc:
+            if require_durable:
+                raise RuntimeError("Durable run storage unavailable") from None
             # Docker may create the container object before `docker run` fails to start it (e.g. exit code
             # 125 when the daemon isn't ready, or a timeout mid-pull). That orphan is left in "Created"
             # state — which the exited-only orphan reaper (reap_orphan_containers, status=exited) never
