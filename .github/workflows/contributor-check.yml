@@ -23,9 +23,19 @@ jobs:
 
       - name: Check for unmapped contributor emails
         id: check-emails
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
-          # Get the merge base between this PR and main
-          MERGE_BASE=$(git merge-base origin/main HEAD)
+          # PRs may target a release branch while origin/main is stale.
+          if [[ "$GITHUB_EVENT_NAME" == pull_request || "$GITHUB_EVENT_NAME" == pull_request_target ]]; then
+            if [[ ! "$PR_BASE_SHA" =~ ^[0-9a-fA-F]{40}$ ]] || ! git cat-file -e "${PR_BASE_SHA}^{commit}"; then
+              echo "::error::Missing or invalid PR base commit"
+              exit 1
+            fi
+            MERGE_BASE=$(git merge-base "$PR_BASE_SHA" HEAD)
+          else
+            MERGE_BASE=$(git merge-base origin/main HEAD)
+          fi
 
           # Find any new author emails in this PR's commits
           NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD --format='%ae' --no-merges | sort -u)
