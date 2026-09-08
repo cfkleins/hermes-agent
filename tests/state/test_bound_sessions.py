@@ -1,6 +1,6 @@
 """A governed case gets one immutable native session binding, never a guessed ID."""
 from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier
+from threading import Barrier, Event, Thread
 import json
 from pathlib import Path
 import sqlite3
@@ -208,25 +208,56 @@ def test_binding_insert_failure_rolls_back_session_and_allows_retry(db):
     assert db.require_session_binding(sid, **identity())["session_id"] == sid
 
 
-def test_binding_read_uses_one_snapshot_during_competing_update(db, monkeypatch):
+@pytest.mark.parametrize("force_writer_fallback", [False, True])
+def test_binding_read_uses_one_snapshot_during_competing_update(db, monkeypatch, force_writer_fallback):
     import hermes_state_bound_sessions as bindings
 
     root = db.create_bound_session(**identity())
     db.end_session(root, "compression")
     db.create_session("snapshot-tip", "demo-desk", parent_session_id=root)
+    if force_writer_fallback:
+        monkeypatch.setattr(db, "_checkout_read_conn", lambda: None)
     original = bindings._validated_binding
     changed = False
+    started, finished = Event(), Event()
+    errors = []
+
+    def update():
+        started.set()
+        try:
+            db._execute_write(lambda c: c.execute(
+                "UPDATE session_bindings SET context_digest=? WHERE session_id=?", ("b" * 64, root)))
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            finished.set()
+
+    writer = Thread(target=update, daemon=True)
 
     def validate(row):
         nonlocal changed
         if not changed:
             changed = True
-            db._execute_write(lambda c: c.execute(
-                "UPDATE session_bindings SET context_digest=? WHERE session_id=?", ("b" * 64, root)))
+            writer.start()
+            assert started.wait(10), "competing writer did not start"
+            if db._wal_active and not force_writer_fallback:
+                # WAL must retain the old snapshot even after a concurrent commit.
+                assert finished.wait(10), "WAL writer did not commit during the read"
+                assert not errors
+            else:
+                # DELETE/pool fallback serializes reads with the non-reentrant
+                # writer lock. Never wait for that writer while holding its lock.
+                assert db._lock.locked()
         return original(row)
 
     monkeypatch.setattr(bindings, "_validated_binding", validate)
-    assert db.get_session_binding("snapshot-tip")["context_digest"] == "a" * 64
+    try:
+        assert db.get_session_binding("snapshot-tip")["context_digest"] == "a" * 64
+    finally:
+        if writer.ident is not None:
+            writer.join(timeout=10)
+    assert not writer.is_alive(), "competing writer did not finish after the read"
+    assert finished.is_set() and not errors
     assert db.get_session_binding("snapshot-tip")["context_digest"] == "b" * 64
 
 
