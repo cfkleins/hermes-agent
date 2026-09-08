@@ -573,6 +573,8 @@ def _touch_stale_kill_activity(agent, elapsed: float) -> None:
 def _check_stale_giveup(agent) -> None:
     """Raise immediately when the consecutive-stale streak is past the
     give-up threshold — no network attempt, no stale-timeout wait."""
+    if getattr(agent, "_exact_system_prompt", None) is not None:
+        return
     _giveup = env_int("HERMES_STREAM_STALE_GIVEUP", 5)
     _streak = _stale_streak(agent)
     if _giveup > 0 and _streak >= _giveup:
@@ -585,6 +587,8 @@ def _check_stale_giveup(agent) -> None:
 
 def _configured_stale_base(agent) -> float:
     """Per-provider ``stale_timeout_seconds`` config, else HERMES_STREAM_STALE_TIMEOUT (180s)."""
+    if getattr(agent, "_exact_system_prompt", None) is not None:
+        return 180.0
     cfg = get_provider_stale_timeout(agent.provider, agent.model)
     return cfg if cfg is not None else env_float("HERMES_STREAM_STALE_TIMEOUT", 180.0)
 
@@ -683,6 +687,8 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     so callers can register it with their abort/close machinery; bedrock / MoA
     manage their own clients. Interrupt/abort/close semantics stay in callers.
     """
+    from agent.tool_execution_policy import enforce_tool_request_policy
+    api_kwargs = enforce_tool_request_policy(agent, api_kwargs)
     if agent.api_mode == "codex_responses":
         return agent._run_codex_stream(api_kwargs, client=make_client("codex_stream_request"),
             on_first_delta=getattr(agent, "_codex_on_first_delta", None))
@@ -1359,6 +1365,29 @@ def _build_chat_completions_kwargs(agent, api_messages, tools_for_api, reasoning
     )
 
 
+def _build_exact_bounded_chat_completions_kwargs(
+    agent, api_messages: list, tools_for_api: list | None,
+) -> dict:
+    """Build the frozen exact-lane request without ambient routing or profiles."""
+    if agent.api_mode != "chat_completions" or agent.provider != "nous":
+        raise RuntimeError("Invalid exact bounded provider lane")
+    if agent.tools or tools_for_api not in (None, []):
+        raise RuntimeError("Exact bounded requests deny all tools")
+    if not isinstance(api_messages, list) or not api_messages:
+        raise RuntimeError("Exact bounded request messages are required")
+    exact_prompt = getattr(agent, "_exact_system_prompt", None)
+    first = api_messages[0] if isinstance(api_messages[0], dict) else {}
+    if first.get("role") != "system" or first.get("content") != exact_prompt:
+        raise RuntimeError("Exact bounded system prompt mismatch")
+    if type(agent.max_tokens) is not int or agent.max_tokens <= 0:
+        raise RuntimeError("Exact bounded output token limit is invalid")
+    return {
+        "model": agent.model,
+        "messages": api_messages,
+        "max_tokens": agent.max_tokens,
+    }
+
+
 def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = None) -> dict:
     """Build the keyword arguments dict for the active API mode.
 
@@ -1369,7 +1398,24 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
     """
     from agent.opencode_affinity import merge_opencode_session_headers
 
-    kwargs = _build_api_kwargs_for_mode(agent, api_messages, tools_for_api)
+    from agent.tool_execution_policy import tools_denied, validate_tool_backend
+    denied = tools_denied(agent)
+    validate_tool_backend(deny_all_tools=denied, api_mode=agent.api_mode,
+                          provider=agent.provider, base_url=getattr(agent, "base_url", None),
+                          acp_command=getattr(agent, "acp_command", None))
+    if getattr(agent, "_exact_system_prompt", None) is not None:
+        kwargs = _build_exact_bounded_chat_completions_kwargs(
+            agent, api_messages, [] if denied else tools_for_api,
+        )
+    else:
+        kwargs = _build_api_kwargs_for_mode(agent, api_messages, [] if denied else tools_for_api)
+    if denied:
+        for key in ("tools", "tool_choice", "parallel_tool_calls", "functions", "function_call"):
+            kwargs.pop(key, None)
+        extra = kwargs.get("extra_body")
+        if isinstance(extra, dict):
+            kwargs["extra_body"] = {k: v for k, v in extra.items()
+                                    if k not in {"tools", "tool_choice", "parallel_tool_calls", "functions", "function_call"}}
     return merge_opencode_session_headers(
         kwargs,
         getattr(agent, "provider", None),
@@ -2637,6 +2683,13 @@ class _StreamingCall(StreamingWaitMonitor):
         ``request_timeout_seconds`` wins over HERMES_API_TIMEOUT (1800s) and
         HERMES_STREAM_READ_TIMEOUT (120s); connect/pool cover the handshake, not
         inference: 30s, or capped at 60s when configured."""
+        if getattr(self.agent, "_exact_system_prompt", None) is not None:
+            stale = self._stream_stale_timeout
+            read = max(
+                120.0,
+                stale if stale is not None and stale != float("inf") else 120.0,
+            )
+            return 1800.0, read, 30.0
         cfg = get_provider_request_timeout(self.agent.provider, self.agent.model)
         base = cfg if cfg is not None else env_float("HERMES_API_TIMEOUT", 1800.0)
         if cfg is not None:
@@ -2680,6 +2733,8 @@ class _StreamingCall(StreamingWaitMonitor):
         return usage, finish_reason
 
     def _open_chat_stream(self, stream_kwargs: dict[str, Any]):
+        from agent.tool_execution_policy import enforce_tool_request_policy
+        stream_kwargs = enforce_tool_request_policy(self.agent, stream_kwargs)
         # Native Gemini rejects OpenAI's usage-streaming extension.
         if not is_native_gemini_base_url(self.agent.base_url):
             stream_kwargs["stream_options"] = {"include_usage": True}
@@ -2691,6 +2746,9 @@ class _StreamingCall(StreamingWaitMonitor):
 
     def _chat_stream_created(self, raw_stream: Any) -> None:
         response = self._attempt_stream_response = getattr(raw_stream, "response", None)
+        if getattr(self.agent, "_exact_system_prompt", None) is not None:
+            self._writer_token = claim_stream_writer(self.agent)
+            return
         self.agent._capture_rate_limits(response)
         self.agent._capture_credits(response)
         self.agent._stream_diag_capture_response(self.clients.diag, response)
@@ -2744,9 +2802,7 @@ class _StreamingCall(StreamingWaitMonitor):
         role = "assistant"
         _diag = self._new_diag()
         self._writer_token = self._attempt_request_client = self._attempt_stream_response = None
-        from agent.chat_completion_helpers_relay import RelayChatAccumulator
-        relay_response = RelayChatAccumulator()
-
+        exact_bounded = getattr(self.agent, "_exact_system_prompt", None) is not None
         def _open_stream(next_api_kwargs: dict[str, Any]):
             timeout = _httpx.Timeout(connect=conn_cap, read=read_timeout, write=base_timeout, pool=conn_cap)
             return self._open_chat_stream({**next_api_kwargs, "stream": True, "timeout": timeout})
@@ -2757,13 +2813,27 @@ class _StreamingCall(StreamingWaitMonitor):
             for text in pending_parts:
                 (self._route_suppressed_text if tool_calls_acc else self._emit_text)(text)
 
-        from agent import relay_llm
-        stream = self._set_managed_stream(relay_llm.stream(self.api_kwargs, _open_stream,
-            **_relay_stream_identity(self.agent, "provider"), finalizer=relay_response.finalize,
-            on_stream_created=self._chat_stream_created, on_chunk=relay_response.observe,
-            accept_chunk=lambda chunk: self._accept_chat_chunk(stream_attempt_id, chunk),
-            completed_response_predicate=lambda value: hasattr(value, "choices"),
-            metadata=_relay_stream_metadata(self.agent, "chat_completions"), defer_logical_completion=True))
+        if exact_bounded:
+            stream = _open_stream(dict(self.api_kwargs))
+            self._chat_stream_created(stream)
+            stream = self._set_managed_stream(stream)
+        else:
+            from agent.chat_completion_helpers_relay import RelayChatAccumulator
+            from agent import relay_llm
+
+            relay_response = RelayChatAccumulator()
+            stream = self._set_managed_stream(relay_llm.stream(
+                self.api_kwargs,
+                _open_stream,
+                **_relay_stream_identity(self.agent, "provider"),
+                finalizer=relay_response.finalize,
+                on_stream_created=self._chat_stream_created,
+                on_chunk=relay_response.observe,
+                accept_chunk=lambda chunk: self._accept_chat_chunk(stream_attempt_id, chunk),
+                completed_response_predicate=lambda value: hasattr(value, "choices"),
+                metadata=_relay_stream_metadata(self.agent, "chat_completions"),
+                defer_logical_completion=True,
+            ))
         if self.agent.provider == "moa":
             # Hermes interrupts the managed stream; Relay alone closes the provider stream.
             self.clients.set_stream_handle(stream)
@@ -2841,7 +2911,7 @@ class _StreamingCall(StreamingWaitMonitor):
         self._close_managed_stream()
         if self._stream_attempt_was_cancelled(stream_attempt_id):
             raise _httpx.RemoteProtocolError(f"stream attempt {stream_attempt_id} was superseded")
-        if stream.final_response is not None:
+        if not exact_bounded and stream.final_response is not None:
             return self._adopt_final_response(stream.final_response)
         return self._finish_chat_stream(stream, role, content_parts, reasoning_parts, tool_calls_acc,
             finish_reason, model_name, usage_obj, flush_pending=_flush_pending_stream_text,
@@ -3075,6 +3145,13 @@ class _StreamingCall(StreamingWaitMonitor):
         """Classify a failed attempt: True = retry; False = stop with
         ``result["error"]`` set (unless our own interrupt force-closed the
         socket). Runs inside the ``except`` so ``logger.exception`` works."""
+        if getattr(self.agent, "_exact_system_prompt", None) is not None:
+            logger.warning(
+                "Bounded streaming request failed closed (error_type=%s)",
+                type(e).__name__,
+            )
+            self.result["error"] = e
+            return False
         import httpx as _httpx
         # Our own interrupt force-close: no retry/fallback/"reconnecting" (the
         # poll loop raises InterruptedError).
@@ -3138,7 +3215,11 @@ class _StreamingCall(StreamingWaitMonitor):
         return self._call_anthropic(request_client)
 
     def _call(self):
-        _max_stream_retries = env_int("HERMES_STREAM_RETRIES", 2)
+        _max_stream_retries = (
+            0
+            if getattr(self.agent, "_exact_system_prompt", None) is not None
+            else env_int("HERMES_STREAM_RETRIES", 2)
+        )
         try:
             for _stream_attempt in range(_max_stream_retries + 1):
                 stream_attempt_id = self._start_stream_attempt()
@@ -3306,7 +3387,10 @@ class _StreamingCall(StreamingWaitMonitor):
         if self.agent._interrupt_requested:  # worker returned early before the monitor saw the flag
             raise InterruptedError("Agent interrupted during streaming API call (post-worker)")
         if self.result["error"] is not None:
-            if self.deltas_were_sent["yes"]:
+            if (
+                self.deltas_were_sent["yes"]
+                and getattr(self.agent, "_exact_system_prompt", None) is None
+            ):
                 return self._partial_stream_stub()
             raise self.result["error"]
         if self.result["response"] is not None:

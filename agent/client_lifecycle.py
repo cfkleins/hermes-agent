@@ -584,6 +584,8 @@ class ClientLifecycleMixin:
         return self._adopt_openai_credentials(api_key, base_url, reason=f"{self.provider}_credential_refresh")
 
     def _try_refresh_nous_client_credentials(self, *, force: bool = True, require_account: str | None = None) -> bool:
+        if getattr(self, "_exact_system_prompt", None) is not None:
+            return False
         # Portal serves anthropic/* on the native Messages route, so either client kind may hold the expiring JWT.
         if self.provider != "nous" or self.api_mode not in ("chat_completions", "anthropic_messages"):
             return False
@@ -725,7 +727,11 @@ class ClientLifecycleMixin:
         latter resolve to ``provider="custom"`` with no registry entry, so they are matched through the
         runtime provider's config lookup instead.
         """
-        if self.api_mode != "chat_completions" or getattr(self, "_fallback_activated", False):
+        if (
+            getattr(self, "_exact_system_prompt", None) is not None
+            or self.api_mode != "chat_completions"
+            or getattr(self, "_fallback_activated", False)
+        ):
             return False
         resolved = self._resolve_env_credentials()
         if resolved is None:

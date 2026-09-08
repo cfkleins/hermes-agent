@@ -1701,7 +1701,13 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     # before the built-in ladder so a profile registered from ~/.hermes/plugins/ or a pip entry
     # point can ship a transport without editing this function (what makes an out-of-tree ACP
     # provider possible). None (the default) falls through, so existing providers are unaffected.
-    provider_client = _provider_supplied_client(agent, client_kwargs)
+    # Provider profiles are an ambient plugin/configuration seam. The exact
+    # bounded lane is fixed to its admitted OpenAI-wire client implementation.
+    provider_client = (
+        None
+        if getattr(agent, "_exact_system_prompt", None) is not None
+        else _provider_supplied_client(agent, client_kwargs)
+    )
     if provider_client is not None:
         _ra().logger.info(
             "%s client created from provider profile (%s, shared=%s) %s",
@@ -2193,6 +2199,9 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     """Invoke a single tool (agent-level or registry-dispatched) and return the result string;
     no display logic. Used by the concurrent path; the sequential path keeps its own inline
     invocation for display."""
+    from agent.tool_execution_policy import tools_denied, DENIED_RESULT
+    if tools_denied(agent):
+        return DENIED_RESULT
     from agent.inline_tool_executors import (
         InlineToolContext, emit_terminal_post_tool_call, resolve_invoke_tool_executor, tool_hook_ids
     )

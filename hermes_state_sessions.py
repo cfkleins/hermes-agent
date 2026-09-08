@@ -237,6 +237,21 @@ _INHERIT_PARENT_ROUTING_SQL = (
     "                             AND p.end_reason = 'compression'\n"
     "                       )"
 )
+_INHERIT_PARENT_PIN_SQL = (
+    "UPDATE sessions SET pinned = 1\n"
+    "                     WHERE id = ? AND parent_session_id IS NOT NULL\n"
+    "                       AND COALESCE(source, '') != 'tool'\n"
+    "                       AND COALESCE(json_extract(COALESCE(model_config, '{}'),"
+    " '$._branched_from'), '') != parent_session_id\n"
+    "                       AND COALESCE(json_extract(COALESCE(model_config, '{}'),"
+    " '$._delegate_from'), '') != parent_session_id\n"
+    "                       AND EXISTS (\n"
+    "                           SELECT 1 FROM sessions p\n"
+    "                           WHERE p.id = sessions.parent_session_id\n"
+    "                             AND p.end_reason = 'compression'\n"
+    "                             AND p.pinned = 1\n"
+    "                       )"
+)
 
 
 class SessionSessionsMixin:
@@ -267,6 +282,7 @@ class SessionSessionsMixin:
         children must NOT inherit them (peer recovery could repoint traffic into a subagent's session)."""
         conn.execute(_INHERIT_PARENT_META_SQL, (session_id,))
         conn.execute(_INHERIT_PARENT_ROUTING_SQL, (session_id,))
+        conn.execute(_INHERIT_PARENT_PIN_SQL, (session_id,))
 
     def _insert_session_row(
         self, session_id: str, source: str, model: str = None, model_config: Dict[str, Any] = None,

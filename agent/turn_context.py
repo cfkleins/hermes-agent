@@ -142,6 +142,8 @@ _UNTITLED_PLATFORMS = frozenset({"cron", "subagent"})
 
 def _maybe_title_session_at_turn_start(agent: Any, messages: List[Any]) -> None:
     """Kick off auto-titling for the session's first user message; never fatal."""
+    if getattr(agent, "_exact_system_prompt", None) is not None:
+        return
     session_db = getattr(agent, "_session_db", None)
     session_id = getattr(agent, "session_id", None)
     if not session_db or not session_id:
@@ -612,6 +614,8 @@ def _collect_pre_llm_call_context(
     """Run ``pre_llm_call`` plugins; their context is injected into the user message
     (never the system prompt). Oversized per-hook context is spilled to disk so a
     runaway plugin can't inflate every subsequent turn's prompt."""
+    if getattr(agent, "_exact_system_prompt", None) is not None:
+        return ""
     try:
         from hermes_cli.lifecycle import invoke_hook as _invoke_hook
         _pre_results = _invoke_hook(
@@ -666,6 +670,8 @@ def _merge_gateway_notes(
     """Gateway must-deliver notes ride the user-message injection channel (one-shot,
     gateway-staged) so the ephemeral system prompt stays byte-stable. Multimodal (list)
     content can't take the string sidecar — append a durable text part instead."""
+    if getattr(agent, "_exact_system_prompt", None) is not None:
+        return plugin_user_context
     _gateway_notes = consume_gateway_turn_context_notes(agent)
     if not _gateway_notes:
         return plugin_user_context
@@ -911,7 +917,12 @@ def build_turn_context(
             plugin_user_context, preflight_compressed=compaction.compressed,
         )
 
-    _persist_turn_start(agent, messages, conversation_history, pending_cli_message)
+    # Exact bounded runs commit only completed user/assistant exchanges. The durable
+    # bounded-run row records failed attempts; pre-call transcript persistence would
+    # leave an unmatched user row after a provider failure and force generic
+    # alternation-repair text into the next exact request.
+    if getattr(agent, "_exact_system_prompt", None) is None:
+        _persist_turn_start(agent, messages, conversation_history, pending_cli_message)
 
     # Title the session now: the row exists and titling depends only on the user's ask,
     # so it runs concurrently with the turn. Daemon thread, no-op once titled.

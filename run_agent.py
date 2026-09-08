@@ -220,9 +220,27 @@ class AIAgent(
         "have been dropped to keep the conversation alive. See issue #15236.]"
     )
 
+    def __setattr__(self, name, value):
+        if name in ("_deny_all_tools", "_require_durable_history") and name in self.__dict__:
+            raise AttributeError(f"{name} is immutable constructor intent")
+        super().__setattr__(name, value)
+
+    def __delattr__(self, name):
+        if name in ("_deny_all_tools", "_require_durable_history"):
+            raise AttributeError(f"{name} is immutable constructor intent")
+        super().__delattr__(name)
+
     @property
     def base_url(self) -> str:
         return self._base_url
+
+    @property
+    def deny_all_tools(self) -> bool:
+        return self._deny_all_tools
+
+    @property
+    def require_durable_history(self) -> bool:
+        return self._require_durable_history
 
     @base_url.setter
     def base_url(self, value: str) -> None:
@@ -240,6 +258,8 @@ class AIAgent(
         enabled_toolsets: List[str] = None, disabled_toolsets: List[str] = None,
         save_trajectories: bool = False, verbose_logging: bool = False, quiet_mode: bool = False,
         tool_progress_mode: str = "all", ephemeral_system_prompt: str = None,
+        exact_system_prompt_bytes: bytes = None,
+        exact_context_length: int = None,
         log_prefix_chars: int = 100, log_prefix: str = "",
         providers_allowed: List[str] = None, providers_ignored: List[str] = None, providers_order: List[str] = None,
         provider_sort: str = None, provider_require_parameters: bool = False, provider_data_collection: str = None,
@@ -270,6 +290,7 @@ class AIAgent(
         checkpoint_max_total_size_mb: int = 500, checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False, requested_provider: str = None,
         capabilities: Dict[str, bool] | None = None,
+        deny_all_tools: bool = False, require_durable_history: bool = False,
     ):
         """Forwarder — see ``agent.agent_init.init_agent`` (same keyword parameters, minus ``tool_delay``)."""
         init_kwargs = {k: v for k, v in locals().items() if k not in ("self", "tool_delay")}

@@ -173,8 +173,13 @@ def assemble_api_request(
 
     # Normalize whitespace and tool-call JSON for bit-perfect prefixes across turns
     # (KV-cache reuse on local servers, better cloud cache hits); API copy only.
-    for am in api_messages:
-        if isinstance(am.get("content"), str):
+    for idx, am in enumerate(api_messages):
+        exact_bound_system = (
+            idx == 0
+            and am.get("role") == "system"
+            and getattr(agent, "_exact_system_prompt", None) is not None
+        )
+        if isinstance(am.get("content"), str) and not exact_bound_system:
             am["content"] = am["content"].strip()
     _canonicalize_api_tool_calls(api_messages)
 

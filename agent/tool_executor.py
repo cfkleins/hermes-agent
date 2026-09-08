@@ -698,6 +698,12 @@ def _run_agent_tool_execution_middleware(
     authorization_gate: _ConcurrentToolAuthorizationGate | None = None,
 ) -> _ManagedToolResult:
     """Run Relay rewrites before Hermes policy and dispatch exactly once."""
+    from agent.tool_execution_policy import tools_denied, DENIED_RESULT
+    if tools_denied(agent):
+        if begin_execution is not None:
+            begin_execution()
+        return _ManagedToolResult(result=DENIED_RESULT, args=function_args,
+                                  middleware_trace=[], blocked=True, dispatched=False)
     from agent import relay_tools
     from hermes_cli.middleware import (
         apply_tool_request_middleware,
@@ -1398,6 +1404,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     """Execute tool calls concurrently; results are appended in original call order.
     ``finalize=False`` skips end-of-batch budget enforcement and /steer injection (the
     segmented dispatcher owns turn-end work)."""
+    from agent.tool_execution_policy import deny_tool_batch
+    if deny_tool_batch(agent, assistant_message, messages):
+        return
     tool_calls = assistant_message.tool_calls
     num_tools = len(tool_calls)
     _tool_budget = _budget_for_agent(agent)  # once per turn, not per result
@@ -1656,6 +1665,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     """Execute tool calls sequentially (single calls or interactive tools). ``finalize=False``
     skips end-of-batch budget enforcement and /steer injection (the segmented dispatcher
     owns turn-end work)."""
+    from agent.tool_execution_policy import deny_tool_batch
+    if deny_tool_batch(agent, assistant_message, messages):
+        return
     _tool_budget = _budget_for_agent(agent)  # once per turn, not per result
     tool_calls = assistant_message.tool_calls
 

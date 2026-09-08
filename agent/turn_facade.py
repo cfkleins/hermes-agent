@@ -11,6 +11,7 @@ from contextlib import suppress
 from typing import Any, Dict, List, Optional
 
 from agent.lazy_forward import forward as _forward
+from agent.tool_execution_policy import with_agent_tool_policy
 
 # Same logger name as the origin module so log records / caplog filters are unchanged.
 logger = logging.getLogger("run_agent")
@@ -19,6 +20,7 @@ logger = logging.getLogger("run_agent")
 class TurnFacadeMixin:
     """run_conversation()/chat() (see module docstring)."""
 
+    @with_agent_tool_policy
     def run_conversation(
         self, user_message: Any, system_message: str=None,
         conversation_history: List[Dict[str, Any]]=None, task_id: str=None,
@@ -26,8 +28,11 @@ class TurnFacadeMixin:
         persist_user_timestamp: Optional[float]=None, persist_user_display_kind: Optional[str]=None,
         persist_user_display_metadata: Optional[Dict[str, Any]]=None,
         persist_user_platform_id: Optional[str]=None, moa_config: Optional[dict[str, Any]]=None,
+        *, binding_identity: Optional[dict[str, str]]=None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
+        from agent.bound_session_admission import validate_bound_turn
+        expected_binding = validate_bound_turn(self, binding_identity)
         # A review shares this session_id for cache parity: fence review startup or interrupt
         # an admitted request and await its exit before opening live-turn instrumentation.
         # Foreground priority is retained if the review does not acknowledge within the bounded deadline
@@ -77,6 +82,7 @@ class TurnFacadeMixin:
             admission = admit_durable_turn_lease(
                 self, session_id=session_id, relay_turn_id=relay_turn_id, task_context=task_context,
                 conversation_history=conversation_history,
+                **({"expected_binding": expected_binding} if expected_binding is not None else {}),
             )
             if admission.early_result is not None:
                 relay_outcome = (

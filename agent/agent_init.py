@@ -626,7 +626,13 @@ _STREAM_STATE: Dict[str, Any] = {
 }
 
 
-def _init_prompt_cache_config(agent):
+def _init_prompt_cache_config(agent, *, exact_mode=False):
+    if exact_mode:
+        agent._use_prompt_caching = False
+        agent._use_native_cache_layout = False
+        agent._cache_disabled = True
+        agent._cache_ttl = None
+        return
     # Anthropic prompt caching (~75% input savings): auto-enabled for Claude on native
     # Anthropic, OpenRouter and anthropic_messages gateways. See _anthropic_prompt_cache_policy.
     agent._use_prompt_caching, agent._use_native_cache_layout = (
@@ -805,6 +811,10 @@ def _explicit_client_kwargs(agent, api_key, base_url, _provider_timeout) -> Dict
         client_kwargs["default_query"] = {k: v[0] for k, v in parse_qs(_parsed_url.query).items()}
     if _provider_timeout is not None:
         client_kwargs["timeout"] = _provider_timeout
+    # The exact bounded lane admits the complete endpoint and credential policy
+    # before construction. Do not add host/profile headers from ambient registries.
+    if getattr(agent, "_exact_system_prompt", None) is not None:
+        return client_kwargs
     if agent.provider == "copilot-acp":
         client_kwargs["command"] = agent.acp_command
         client_kwargs["args"] = agent.acp_args
@@ -891,6 +901,10 @@ _FINE_GRAINED_BETA = "fine-grained-tool-streaming-2025-05-14"
 def _apply_openai_header_policy(agent, client_kwargs: Dict[str, Any]) -> None:
     """Mutate ``client_kwargs`` (== ``agent._client_kwargs``) with header/TLS policy, in order:
     OpenRouter Claude beta header → model.default_headers → custom-provider TLS/extra_headers."""
+    # Exact bounded construction is authority-complete. Ambient model headers,
+    # custom-provider TLS, and extra headers are outside the admitted policy.
+    if getattr(agent, "_exact_system_prompt", None) is not None:
+        return
     # Fine-grained tool streaming for Claude on OpenRouter: without the beta header
     # Anthropic buffers the whole tool call and OpenRouter's proxy times out.
     _effective_base = str(client_kwargs.get("base_url", "")).lower()
@@ -948,12 +962,19 @@ def _init_openai_client(agent, api_key, base_url, fallback_model, _provider_time
         raise RuntimeError(f"Failed to initialize OpenAI client: {e}")
 
 
-def _build_client(agent, api_key, base_url, fallback_model):
+_PROVIDER_TIMEOUT_UNSET = object()
+
+
+def _build_client(agent, api_key, base_url, fallback_model, *, provider_timeout=_PROVIDER_TIMEOUT_UNSET):
     # LLM client per wire mode (raw_codex=True: the main agent needs direct
     # responses.stream()). One provider/model timeout up front so every path applies it.
     agent._anthropic_client = None
     agent._is_anthropic_oauth = False
-    _provider_timeout = get_provider_request_timeout(agent.provider, agent.model)
+    _provider_timeout = (
+        get_provider_request_timeout(agent.provider, agent.model)
+        if provider_timeout is _PROVIDER_TIMEOUT_UNSET
+        else provider_timeout
+    )
     if agent.api_mode == "anthropic_messages":
         _init_anthropic_client(agent, api_key, base_url, _provider_timeout)
     elif agent.provider == "moa":
@@ -1047,6 +1068,13 @@ def _init_fallback_chain(agent, fallback_model):
 
 
 def _load_tools(agent, enabled_toolsets, disabled_toolsets):
+    from agent.tool_execution_policy import tools_denied
+    if tools_denied(agent):
+        agent.tools = []
+        agent.valid_tool_names = set()
+        agent._tool_snapshot_generation = 0
+        agent._kanban_worker_guidance = ""
+        return
     # A multiplexed gateway may have switched HERMES_HOME since model_tools was imported;
     # make sure this profile's plugins are discovered before the tool snapshot.
     try:
@@ -1123,7 +1151,8 @@ def _publish_session_id(session_id: str) -> None:
 
 
 def _init_session_state(agent, session_id, session_db, parent_session_id, reasoning_config, max_tokens,
-    checkpoints_enabled, checkpoint_max_snapshots, checkpoint_max_total_size_mb, checkpoint_max_file_size_mb):
+    checkpoints_enabled, checkpoint_max_snapshots, checkpoint_max_total_size_mb, checkpoint_max_file_size_mb,
+    *, exact_mode=False):
     agent.session_start = datetime.now()
     agent.session_id = session_id or (
         f"{agent.session_start.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
@@ -1351,11 +1380,16 @@ def _apply_agent_section(agent, _agent_cfg):
     # platform_hints: <platform>: {append|replace}, stored verbatim (agent/system_prompt.py).
     agent._platform_hint_overrides = _cfg_dict(_agent_cfg, "platform_hints")
 
-    # App-level API retry count (wraps each model API call). Default 3; 1 = single attempt.
-    try:
-        _api_retries = max(int(_agent_section.get("api_max_retries", 3)), 1)
-    except (TypeError, ValueError):
-        _api_retries = 3
+    # Exact bounded execution is always one provider attempt and never inherits
+    # retry policy from ambient configuration.
+    if getattr(agent, "_exact_system_prompt", None) is not None:
+        _api_retries = 1
+    else:
+        # App-level API retry count. Default 3; 1 = single attempt.
+        try:
+            _api_retries = max(int(_agent_section.get("api_max_retries", 3)), 1)
+        except (TypeError, ValueError):
+            _api_retries = 3
     agent._api_max_retries = _api_retries
 
 
@@ -2181,6 +2215,8 @@ def init_agent(
     enabled_toolsets: List[str] = None, disabled_toolsets: List[str] = None,
     save_trajectories: bool = False, verbose_logging: bool = False, quiet_mode: bool = False,
     tool_progress_mode: str = "all", ephemeral_system_prompt: str = None,
+    exact_system_prompt_bytes: bytes = None,
+    exact_context_length: int = None,
     log_prefix_chars: int = 100, log_prefix: str = "", providers_allowed: List[str] = None,
     providers_ignored: List[str] = None, providers_order: List[str] = None,
     provider_sort: str = None, provider_require_parameters: bool = False,
@@ -2209,6 +2245,7 @@ def init_agent(
     checkpoint_max_snapshots: int = 20, checkpoint_max_total_size_mb: int = 500,
     checkpoint_max_file_size_mb: int = 10, pass_session_id: bool = False,
     requested_provider: str = None, capabilities: Optional[Dict[str, bool]] = None,
+    deny_all_tools: bool = False, require_durable_history: bool = False,
 ):
     """Initialize the AI Agent (body of :meth:`AIAgent.__init__`).
 
@@ -2223,6 +2260,58 @@ def init_agent(
       skip_context_files: skip SOUL.md/.hermes.md/AGENTS.md/CLAUDE.md/.cursorrules injection;
         load_soul_identity keeps ~/.hermes/SOUL.md as identity regardless.
     """
+    exact_system_prompt = None
+    if exact_system_prompt_bytes is not None:
+        if type(exact_system_prompt_bytes) is not bytes or not exact_system_prompt_bytes:
+            raise TypeError("exact_system_prompt_bytes must be non-empty bytes")
+        if len(exact_system_prompt_bytes) > 131_072:
+            raise ValueError("exact_system_prompt_bytes is too large")
+        if (type(exact_context_length) is not int or exact_context_length < 65_536
+                or exact_context_length > 16_777_216):
+            raise ValueError("exact_context_length is invalid")
+        try:
+            exact_system_prompt = exact_system_prompt_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError("exact_system_prompt_bytes must be valid UTF-8") from exc
+        exact_mode = (
+            skip_context_files is True
+            and load_soul_identity is False
+            and skip_memory is True
+            and skip_background_review is True
+            and deny_all_tools is True
+            and require_durable_history is True
+            and enabled_toolsets == []
+            and credential_pool is None
+            and fallback_model is None
+            and request_overrides is None
+            and not ephemeral_system_prompt
+        )
+        if not exact_mode:
+            raise ValueError("exact system prompt requires bounded construction")
+
+    for name, value in (("deny_all_tools", deny_all_tools),
+                        ("require_durable_history", require_durable_history)):
+        if type(value) is not bool:
+            raise TypeError(f"{name} must be a bool")
+        if hasattr(agent, "_" + name):
+            raise AttributeError(f"{name} is immutable constructor intent")
+    binding = None
+    if session_id and callable(getattr(type(session_db), "get_session_binding", None)):
+        binding = session_db.get_session_binding(session_id)
+        if binding is not None:
+            if not isinstance(binding, dict) or binding.get("tool_policy") != "deny_all":
+                raise ValueError("Unsupported durable session tool policy")
+            deny_all_tools = True
+            require_durable_history = True
+    agent._bound_session_binding = dict(binding) if binding is not None else None
+    agent._exact_system_prompt = exact_system_prompt
+    agent._exact_context_length = exact_context_length if exact_system_prompt is not None else None
+    for name, value in (("deny_all_tools", deny_all_tools),
+                        ("require_durable_history", require_durable_history)):
+        setattr(agent, "_" + name, value)
+    from agent.tool_execution_policy import validate_tool_backend
+    validate_tool_backend(deny_all_tools=deny_all_tools, api_mode=api_mode,
+                          provider=provider, base_url=base_url, acp_command=acp_command or command)
     _install_safe_stdio()
 
     _params = locals()
@@ -2258,6 +2347,8 @@ def init_agent(
     agent.acp_args = list(acp_args or args or [])
     _resolve_api_mode(agent, api_mode, provider_name, base_url)
     _finalize_routing(agent, api_mode, credential_pool)
+    validate_tool_backend(deny_all_tools=deny_all_tools, api_mode=agent.api_mode,
+                          provider=agent.provider, base_url=agent.base_url, acp_command=agent.acp_command)
 
     # Platform callbacks are stored under their parameter names verbatim.
     for _cb in _CALLBACK_PARAMS:
@@ -2267,37 +2358,59 @@ def init_agent(
     _set_defaults(agent, _CONTROL_STATE)
 
     # reasoning_content echo opt-in; switch_model / fallback / restore keep it in sync.
-    agent._reasoning_echo_flag = agent._read_reasoning_echo_from_config()
+    agent._reasoning_echo_flag = (
+        False if exact_system_prompt is not None
+        else agent._read_reasoning_echo_from_config()
+    )
     agent.request_overrides = dict(request_overrides or {})
     agent.prefill_messages = prefill_messages or []  # Prefilled conversation turns
     agent._force_ascii_payload = False
 
-    _init_prompt_cache_config(agent)
+    _init_prompt_cache_config(agent, exact_mode=exact_system_prompt is not None)
     _init_turn_state(agent, run_budget_seconds)
     _setup_logging(agent)
     _set_defaults(agent, _STREAM_STATE)
-    _build_client(agent, api_key, base_url, fallback_model)
+    _build_client(
+        agent, api_key, base_url, fallback_model,
+        provider_timeout=None if exact_system_prompt is not None else _PROVIDER_TIMEOUT_UNSET,
+    )
     _init_fallback_chain(agent, fallback_model)
     _load_tools(agent, enabled_toolsets, disabled_toolsets)
     _init_session_state(
         agent, session_id, session_db, parent_session_id, reasoning_config, max_tokens,
         checkpoints_enabled, checkpoint_max_snapshots, checkpoint_max_total_size_mb, checkpoint_max_file_size_mb,
+        exact_mode=exact_system_prompt is not None,
     )
 
-    # Load config once for memory, skills, and compression sections
-    try:
-        from hermes_cli.config import load_config_readonly as _load_agent_config
-        _agent_cfg = _load_agent_config()
-    except Exception:
-        _agent_cfg = {}
+    # Exact bounded construction must not observe ambient config. Its complete
+    # reviewed system prompt and runtime settings arrived as immutable arguments.
+    if exact_system_prompt is not None:
+        _agent_cfg = {
+            "model": {"context_length": exact_context_length},
+            "compression": {"enabled": False},
+        }
+    else:
+        try:
+            from hermes_cli.config import load_config_readonly as _load_agent_config
+            _agent_cfg = _load_agent_config()
+        except Exception:
+            _agent_cfg = {}
 
     _apply_display_config(agent, _agent_cfg, platform)
     _init_memory(agent, _agent_cfg, skip_memory, platform)
     _apply_agent_section(agent, _agent_cfg)
     cs = _parse_compression_config(agent, _agent_cfg)
-    _config_context_length, _custom_providers, _effective_context_length, _model_cfg = _resolve_context_length(
-        agent, _agent_cfg, base_url
-    )
+    if exact_system_prompt is not None:
+        _config_context_length = exact_context_length
+        _custom_providers = []
+        _effective_context_length = exact_context_length
+        _model_cfg = {"context_length": exact_context_length}
+        agent._custom_providers = []
+        agent._config_context_length = exact_context_length
+    else:
+        _config_context_length, _custom_providers, _effective_context_length, _model_cfg = _resolve_context_length(
+            agent, _agent_cfg, base_url
+        )
     _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_context_length, session_db)
     _enforce_minimum_context(agent)
     _warn_nonagentic_hermes_model(agent)

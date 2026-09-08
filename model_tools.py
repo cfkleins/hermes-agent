@@ -814,6 +814,9 @@ def handle_function_call(
     it (single-fire contract). enabled/disabled_toolsets scope the Tool Search
     bridge catalog to this session's grant (None = unrestricted).
     """
+    from agent.tool_execution_policy import DENIED_RESULT, tools_denied
+    if tools_denied(None):
+        return DENIED_RESULT
     function_args = coerce_tool_args(function_name, function_args)
     if not isinstance(function_args, dict):
         function_args = {}

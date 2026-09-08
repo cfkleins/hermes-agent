@@ -119,6 +119,7 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms import api_server_room_dispatch as _room_dispatch
 from gateway.platforms import api_server_room_grants as _room_grants
 from gateway.platforms import api_server_runs as _api_runs
+from gateway.platforms import api_server_bounded_runs as _bounded_runs
 from gateway.platforms.api_server_openai_routes import OpenAICompatRoutesMixin
 from gateway.platforms.base import (
     MEDIA_TAG_CLEANUP_RE, BasePlatformAdapter, SendResult, is_network_accessible, validate_media_delivery_path)
@@ -1086,6 +1087,14 @@ def _run_route_delegate(name: str):
     return _handler
 
 
+def _bounded_run_route_delegate(name: str):
+    """Adapter method forwarding to the isolated bounded Runs route module."""
+    async def _handler(self, request: "web.Request") -> "web.Response":
+        return await getattr(_bounded_runs, name)(self, request)
+    _handler.__name__ = name
+    return _handler
+
+
 class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     """aiohttp server routing OpenAI-format requests through hermes-agent's AIAgent."""
 
@@ -1130,6 +1139,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         self._site: Optional["web.TCPSite"] = None
         self._response_store = ResponseStore()
         _api_runs._initialize_run_state(self, store_factory=RunIdempotencyStore)
+        _bounded_runs.initialize_bounded_run_state(self)
         self._session_db: Optional[Any] = None  # explicit override (tests/manual wiring)
         self._session_dbs: Dict[str, Any] = {}  # per-profile-home SessionDB cache
         self._session_db_cache_lock = threading.Lock()
@@ -1157,12 +1167,24 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         self._browser_control_artifact_limiter: Optional[ArtifactRateLimiter] = None
 
     def active_agent_work_count(self) -> int:
-        """All live agent work: pending admissions + in-flight turns + live /v1/runs tasks
-        (task-based, since ``_active_run_agents`` has a queued-before-agent gap)."""
+        """All live agent work: admissions, turns, and generic or bounded run tasks.
+
+        Task-based counting covers the queued-before-agent gap without exposing
+        bounded ownership through the generic run maps.
+        """
         try:
+            pending_terminal_ids = set(
+                getattr(self, "_bounded_pending_terminal_statuses", {})
+            )
             return (int(getattr(self, "_pending_agent_requests", 0))
                     + int(self._inflight_agent_runs)
-                    + sum(not task.done() for task in self._active_run_tasks.values()))
+                    + sum(not task.done() for task in self._active_run_tasks.values())
+                    + sum(
+                        not task.done()
+                        for run_id, task in self._bounded_active_run_tasks.items()
+                        if run_id not in pending_terminal_ids
+                    )
+                    + len(pending_terminal_ids))
         except Exception:
             return 0
 
@@ -1171,7 +1193,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         ``GatewayRunner._running_agents``): exactly the set the drain waits on. Returns count."""
         # Dedupe by identity: an agent in both registries must be interrupted once.
         agents = {id(agent): agent for agent in (
-            *self._active_run_agents.values(), *self._shutdown_interruptible_agents.values())
+            *self._active_run_agents.values(),
+            *self._bounded_active_run_agents.values(),
+            *self._shutdown_interruptible_agents.values(),
+        )
             if agent is not None}
         interrupted = 0
         for agent in agents.values():
@@ -1536,6 +1561,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job)]
         routes.extend(_room_grants._http_routes(self))
         routes.extend(_api_runs._http_routes(self))
+        routes.extend(_bounded_runs._http_routes(self))
         if _CRON_AVAILABLE:
             # Chronos fire webhook (NAS -> agent): authenticated by a NAS-minted JWT.
             routes.append(("POST", "/api/cron/fire", self._handle_cron_fire))
@@ -3514,7 +3540,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         if hasattr(task, "add_done_callback"):
             task.add_done_callback(self._background_tasks.discard)
 
-    def _concurrency_limited_response(self) -> Optional["web.Response"]:
+    def _concurrency_limited_response(
+        self, *, exclude_current_pending: bool = False
+    ) -> Optional["web.Response"]:
         """429 when the concurrent-run cap is reached (0 disables), else None. Uses the same
         adapter-owned work count as shutdown draining (admitted requests included)."""
         limit = self._max_concurrent_runs
@@ -3523,7 +3551,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         inflight = self.active_agent_work_count()
         # The current request's own reservation must not consume its last available slot.
         reservation = _api_agent_request_reservation.get()
-        if reservation and reservation["active"]:
+        if (reservation and reservation["active"]) or exclude_current_pending:
             inflight -= 1
         if inflight >= limit:
             return _error_response(
@@ -3766,6 +3794,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     _handle_run_approval = _run_route_delegate("_handle_run_approval")
     _handle_steer_run = _run_route_delegate("_handle_steer_run")
     _handle_stop_run = _run_route_delegate("_handle_stop_run")
+
+    _handle_bounded_runs = _bounded_run_route_delegate("handle_bounded_runs")
+    _handle_get_bounded_run = _bounded_run_route_delegate("handle_get_bounded_run")
+    _handle_stop_bounded_run = _bounded_run_route_delegate("handle_stop_bounded_run")
 
     async def _sweep_orphaned_runs(self) -> None:
         return await _api_runs._sweep_orphaned_runs(self)

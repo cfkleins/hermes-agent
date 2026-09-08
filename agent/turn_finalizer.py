@@ -503,7 +503,11 @@ def finalize_turn(
     _platform = getattr(agent, "platform", None) or ""
     _response_transformed = False
     _pre_transform_response = None
-    if final_response and not interrupted:
+    if (
+        final_response
+        and not interrupted
+        and getattr(agent, "_exact_system_prompt", None) is None
+    ):
         final_response, _response_transformed, _pre_transform_response = _apply_output_hooks(
             agent, final_response, logger, platform=_platform, effective_task_id=effective_task_id,
             turn_id=turn_id, original_user_message=original_user_message, messages=messages,
@@ -622,18 +626,19 @@ def finalize_turn(
 
     # Memory provider on_session_end()/shutdown_all() are NOT called here:
     # run_conversation() runs once per message; CLI/gateway own session-end cleanup.
-    _invoke_hook_safely(
-        "on_session_end", logger,
-        session_id=agent.session_id,
-        task_id=effective_task_id,
-        turn_id=turn_id,
-        completed=completed,
-        failed=failed,
-        interrupted=interrupted,
-        turn_exit_reason=_turn_exit_reason,
-        model=agent.model,
-        platform=_platform,
-    )
+    if getattr(agent, "_exact_system_prompt", None) is None:
+        _invoke_hook_safely(
+            "on_session_end", logger,
+            session_id=agent.session_id,
+            task_id=effective_task_id,
+            turn_id=turn_id,
+            completed=completed,
+            failed=failed,
+            interrupted=interrupted,
+            turn_exit_reason=_turn_exit_reason,
+            model=agent.model,
+            platform=_platform,
+        )
 
     agent._turn_preflight_display_snapshot = None
     agent._turn_received_provider_response = False

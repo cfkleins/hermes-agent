@@ -215,6 +215,75 @@ class RunIdempotencyStore:
                 "SELECT 1 FROM run_idempotency WHERE scope=? AND run_id=?", (scope, run_id)).fetchone()
         return row is not None
 
+    def rollback_reservation(
+        self, scope: str, key: str, fingerprint: str, run_id: str
+    ) -> bool:
+        """Delete only the exact unpublished reservation owned by the caller."""
+        with self._immediate_txn():
+            row = self._conn.execute(_SELECT_BY_KEY, (scope, key)).fetchone()
+            if row is None or not hmac.compare_digest(row[0], fingerprint) or row[1] != run_id:
+                self._conn.commit()
+                return False
+            status = json.loads(row[2])
+            if status.get("admission_state") != "reserved":
+                self._conn.commit()
+                return False
+            changed = self._conn.execute(
+                "DELETE FROM run_idempotency WHERE scope=? AND idempotency_key=? "
+                "AND fingerprint=? AND run_id=?",
+                (scope, key, fingerprint, run_id),
+            ).rowcount
+            self._conn.commit()
+        return changed == 1
+
+    def publish_reservation(
+        self,
+        scope: str,
+        key: str,
+        fingerprint: str,
+        run_id: str,
+        status: Dict[str, Any],
+    ) -> bool:
+        """Publish only the caller's exact still-reserved run."""
+        with self._immediate_txn():
+            row = self._conn.execute(_SELECT_BY_KEY, (scope, key)).fetchone()
+            if row is None or not hmac.compare_digest(row[0], fingerprint) or row[1] != run_id:
+                self._conn.commit()
+                return False
+            current = json.loads(row[2])
+            if current.get("admission_state") != "reserved":
+                self._conn.commit()
+                return False
+            changed = self._conn.execute(
+                "UPDATE run_idempotency SET status_json=?, updated_at=? "
+                "WHERE scope=? AND idempotency_key=? AND fingerprint=? AND run_id=?",
+                (
+                    _encode_status(status),
+                    time.time(),
+                    scope,
+                    key,
+                    fingerprint,
+                    run_id,
+                ),
+            ).rowcount
+            self._conn.commit()
+        return changed == 1
+
+    def update_status_strict(
+        self, scope: str, run_id: str, status: Dict[str, Any]
+    ) -> None:
+        """Persist a bounded status or fail if its scoped reservation vanished."""
+        with self._lock:
+            changed = self._conn.execute(
+                "UPDATE run_idempotency SET status_json=?, updated_at=? "
+                "WHERE scope=? AND run_id=?",
+                (_encode_status(status), time.time(), scope, run_id),
+            ).rowcount
+            if changed != 1:
+                self._conn.rollback()
+                raise RuntimeError("Bounded run reservation is unavailable")
+            self._conn.commit()
+
     def update_status(self, run_id: str, status: Dict[str, Any]) -> None:
         with self._lock:
             self._conn.execute(

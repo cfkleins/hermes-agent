@@ -644,6 +644,16 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     Mutates ``agent._cached_system_prompt`` and persists a freshly-built prompt on first
     build. Row states ``missing``/``null``/``empty``/``present`` are logged and DB
     failures log at WARNING so silent prefix-cache misses show in ``agent.log``."""
+    exact_prompt = getattr(agent, "_exact_system_prompt", None)
+    if exact_prompt is not None:
+        if not isinstance(exact_prompt, str) or not exact_prompt:
+            raise RuntimeError("Bounded system prompt is unavailable")
+        if system_message not in (None, "") or getattr(agent, "ephemeral_system_prompt", None):
+            raise RuntimeError("Bounded system prompt cannot be extended")
+        agent._cached_system_prompt = exact_prompt
+        agent._cached_system_prompt_static = None
+        return
+
     stored_prompt = None
     stored_state = "missing"
     session_row = None

@@ -78,6 +78,7 @@ def perform_api_call(
         thinking_spinner = stop_thinking_spinner(agent, thinking_spinner)
 
     _use_streaming = _should_stream(agent)
+    _exact_bounded = getattr(agent, "_exact_system_prompt", None) is not None
 
     def _perform_api_call(next_api_kwargs):
         if agent.api_mode == "codex_responses":
@@ -89,6 +90,8 @@ def perform_api_call(
             return agent._interruptible_streaming_api_call(
                 next_api_kwargs, on_first_delta=_stop_spinner
             )
+        if _exact_bounded:
+            return agent._interruptible_api_call(next_api_kwargs)
         from agent import relay_llm
 
         return relay_llm.execute(
@@ -112,8 +115,6 @@ def perform_api_call(
             defer_logical_completion=True,
         )
 
-    from hermes_cli.middleware import run_llm_execution_middleware
-
     # The ``_model_request_active`` bracket is taken under the redirect lock when one exists,
     # so redirect() can't observe a half-toggled flag.
     _model_request_active = getattr(agent, "_model_request_active", None)
@@ -123,13 +124,18 @@ def perform_api_call(
         if _model_request_active is not None:
             _model_request_active.set()
     try:
-        response = run_llm_execution_middleware(
-            api_kwargs, _perform_api_call, original_request=_original_api_kwargs,
-            task_id=effective_task_id, turn_id=turn_id, api_request_id=api_request_id,
-            session_id=agent.session_id or "", platform=agent.platform or "", model=agent.model,
-            provider=agent.provider, base_url=agent.base_url, api_mode=agent.api_mode,
-            api_call_count=api_call_count, middleware_trace=list(_llm_middleware_trace),
-        )
+        if _exact_bounded:
+            response = _perform_api_call(api_kwargs)
+        else:
+            from hermes_cli.middleware import run_llm_execution_middleware
+
+            response = run_llm_execution_middleware(
+                api_kwargs, _perform_api_call, original_request=_original_api_kwargs,
+                task_id=effective_task_id, turn_id=turn_id, api_request_id=api_request_id,
+                session_id=agent.session_id or "", platform=agent.platform or "", model=agent.model,
+                provider=agent.provider, base_url=agent.base_url, api_mode=agent.api_mode,
+                api_call_count=api_call_count, middleware_trace=list(_llm_middleware_trace),
+            )
     finally:
         with _bracket:
             if _model_request_active is not None:
@@ -217,6 +223,9 @@ def nous_rate_limit_guard(
             action=action, active_system_prompt=active_system_prompt, retry_count=retry_count,
             compression_attempts=compression_attempts, result=result,
         )
+
+    if getattr(agent, "_exact_system_prompt", None) is not None:
+        return _verdict("fallthrough")
 
     if agent.provider == "nous":
         try:

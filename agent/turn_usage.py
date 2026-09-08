@@ -17,7 +17,7 @@ from typing import Any, Dict, List
 
 from agent.image_token_cost import calibrate_from_usage
 from agent.usage_anchor import capture_usage_anchor, set_usage_anchor
-from agent.usage_pricing import estimate_usage_cost, normalize_usage
+from agent.usage_pricing import CostResult, estimate_usage_cost, normalize_usage
 
 logger = logging.getLogger("agent.conversation_loop")
 
@@ -214,10 +214,19 @@ def record_response_usage(
         _agg_cost_model = _agg_slot["model"]
         _agg_cost_provider = _agg_slot.get("provider") or agent.provider
         _agg_cost_base_url = _agg_slot.get("base_url") or agent.base_url
-    cost_result = estimate_usage_cost(
-        _agg_cost_model, aggregator_usage, provider=_agg_cost_provider,
-        base_url=_agg_cost_base_url, api_key=getattr(agent, "api_key", ""),
-    )
+    if getattr(agent, "_exact_system_prompt", None) is not None:
+        # Exact bounded turns may contact only their admitted completion route.
+        # Pricing discovery can issue an auxiliary GET /models and load ambient
+        # provider plugins, so retain token accounting and report cost honestly
+        # as unavailable instead of probing or fabricating zero spend.
+        cost_result = CostResult(
+            amount_usd=None, status="unknown", source="none", label="n/a",
+        )
+    else:
+        cost_result = estimate_usage_cost(
+            _agg_cost_model, aggregator_usage, provider=_agg_cost_provider,
+            base_url=_agg_cost_base_url, api_key=getattr(agent, "api_key", ""),
+        )
     # Cost delta = aggregator + MoA advisor cost (already priced per-advisor at each
     # advisor's own model rate), so state.db's estimated_cost_usd matches the folded
     # token counts.

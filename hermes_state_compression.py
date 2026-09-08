@@ -167,15 +167,16 @@ class SessionCompressionMixin:
                    system_prompt_hash,
                    parent_session_id, cwd, git_branch, git_repo_root,
                    profile_name, user_id, session_key, chat_id, chat_type,
-                   thread_id, display_name, origin_json, started_at
-                ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   thread_id, display_name, origin_json, pinned, started_at
+                ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 child_session_id, source, model, json.dumps(model_config) if model_config else None,
                 system_prompt_hash, parent_session_id, cwd or parent["cwd"], parent["git_branch"],
                 parent["git_repo_root"],
                 profile_name or parent["profile_name"] or self._own_profile_name(),
                 parent["user_id"], parent["session_key"], parent["chat_id"], parent["chat_type"],
-                parent["thread_id"], parent["display_name"], parent["origin_json"], time.time()),
+                parent["thread_id"], parent["display_name"], parent["origin_json"],
+                parent["pinned"], time.time()),
         )
 
     def publish_compression_child(
@@ -213,7 +214,7 @@ class SessionCompressionMixin:
                 raise CompressionSessionBusyError(
                     f"Compression lease lost before publication: {parent_session_id}")
             parent = conn.execute(
-                """SELECT ended_at, end_reason, cwd, git_branch, git_repo_root,
+                """SELECT ended_at, end_reason, cwd, git_branch, git_repo_root, pinned,
                           user_id, session_key, chat_id, chat_type,
                           thread_id, display_name, origin_json, profile_name
                    FROM sessions WHERE id = ?""",
@@ -469,10 +470,12 @@ class SessionCompressionMixin:
 
     def try_acquire_session_turn_lease(
         self, session_id: str, holder: str, *, ttl_seconds: float = 300.0, patience_s: Optional[float] = None,
-    ) -> bool:
+        return_key: bool = False,
+    ) -> bool | str:
         """Atomically acquire the cross-process turn lease for a conversation (keyed by the
         lineage root). The walk, the INSERT, and reclaim of expired or dead-local-PID leases
-        share one write transaction."""
+        share one write transaction. ``return_key`` returns the captured claimed key on
+        success instead of True; failure remains False. Default callers retain bool results."""
         from hermes_state import _compression_lock_holder_process_is_dead
         if not session_id or not holder:
             return False
@@ -480,17 +483,19 @@ class SessionCompressionMixin:
         expires_at = now + max(0.1, float(ttl_seconds))
         def _do(conn):
             conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
-            return _claim_lease_row(
+            acquired = _claim_lease_row(
                 conn, "session_turn_leases", "conversation_id", conversation_id, holder, now, expires_at,
                 lambda h, e: float(e) <= now or _compression_lock_holder_process_is_dead(h),
             )[0]
-        return bool(self._execute_write(_do, patience_s=patience_s))
+            return conversation_id if acquired and return_key else bool(acquired)
+        return self._execute_write(_do, patience_s=patience_s)
 
     def acquire_session_turn_lease(
         self, session_id: str, holder: str, *, ttl_seconds: float = 300.0,
         wait_seconds: float = 1800.0, poll_interval_seconds: float = 1.0, on_wait=None,
         wait_notice_interval_seconds: float = 15.0, should_abort=None, acquire_patience_s: float = 0.5,
-    ) -> bool:
+        return_key: bool = False,
+    ) -> bool | str:
         """Wait for a cross-process turn lease without holding a SQLite lock. ``on_wait(elapsed)`` is
         best-effort: called when the first attempt fails and about every ``wait_notice_interval_seconds``
         after. ``should_abort()`` True (e.g. ``/stop``) returns False at once."""
@@ -507,9 +512,11 @@ class SessionCompressionMixin:
                 except Exception:
                     logger.debug("session turn lease should_abort callback failed", exc_info=True)
             try:
-                if self.try_acquire_session_turn_lease(
-                    session_id, holder, ttl_seconds=ttl_seconds, patience_s=acquire_patience_s):
-                    return True
+                acquired = self.try_acquire_session_turn_lease(
+                    session_id, holder, ttl_seconds=ttl_seconds, patience_s=acquire_patience_s,
+                    **({"return_key": True} if return_key else {}))
+                if acquired:
+                    return acquired
             except sqlite3.Error as exc:
                 # Long holder transactions can exhaust one write-patience budget; keep
                 # polling until wait_seconds or should_abort.
@@ -544,12 +551,15 @@ class SessionCompressionMixin:
             ).rowcount > 0
         return bool(self._execute_write(_do))
 
-    def release_session_turn_lease(self, session_id: str, holder: str) -> None:
-        """Release a turn lease iff ``holder`` still owns it; idempotent."""
+    def release_session_turn_lease(self, session_id: str, holder: str, *, lease_key: Optional[str] = None) -> None:
+        """Release a turn lease iff ``holder`` still owns it; idempotent.
+
+        A captured ``lease_key`` prevents later lineage changes from redirecting cleanup.
+        """
         if not session_id or not holder:
             return
         def _do(conn):
-            conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
+            conversation_id = lease_key if lease_key is not None else self._session_turn_lease_key_on_conn(conn, session_id)
             conn.execute(
                 "DELETE FROM session_turn_leases WHERE conversation_id = ? AND holder = ?",
                 (conversation_id, holder))
@@ -595,7 +605,7 @@ class SessionCompressionMixin:
                 (time.time(), cutoff),
         ) or 0
 
-    def get_compression_chain(self, session_id: str) -> List[str]:
+    def get_compression_chain(self, session_id: str, *, strict: bool = False) -> List[str]:
         """Walk the compression-continuation chain forward: root-first through the tip (``[session_id]``
         when no continuation); ``get_compression_tip`` is the last element. A continuation is a child of
         a session with ``end_reason='compression'``. The old ``child.started_at >= parent.ended_at`` test
@@ -610,17 +620,22 @@ class SessionCompressionMixin:
             with self._read_ctx() as conn:
                 row = conn.execute(_CHAIN_STEP_SQL, (current,)).fetchone()
             child_id = row["id"] if row is not None else None
+            if strict and child_id in seen:
+                raise ValueError("Compression lineage contains a cycle")
             if not child_id or child_id in seen:
                 return chain
             seen.add(child_id)
             current = child_id
             chain.append(child_id)
+        if strict:
+            raise ValueError("Compression lineage exceeds the depth limit")
         return chain
 
-    def get_compression_tip(self, session_id: str) -> Optional[str]:
+    def get_compression_tip(self, session_id: str, *, strict: bool = False) -> Optional[str]:
         """Live tip of a compression chain (``get_compression_chain`` semantics); the input
         id when no continuation exists."""
-        chain = self.get_compression_chain(session_id)
+        chain = (self.get_compression_chain(session_id, strict=True) if strict
+                 else self.get_compression_chain(session_id))
         return chain[-1] if chain else session_id
 
     def _is_compression_child_row(self, child: Dict[str, Any]) -> bool:

@@ -109,6 +109,18 @@ class TestAPIServerAdapterWorkCount:
 
         assert adapter.active_agent_work_count() == 1
 
+    def test_counts_bounded_run_tasks_without_generic_map_aliasing(self):
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        adapter._active_run_tasks = {"generic": _RunTask()}
+        adapter._bounded_active_run_tasks = {
+            "bounded": _RunTask(),
+            "bounded-finished": _RunTask(done=True),
+        }
+        adapter._bounded_active_run_agents = {"bounded": object()}
+
+        assert adapter.active_agent_work_count() == 2
+        assert "bounded" not in adapter._active_run_tasks
+
     def test_interrupt_active_runs_interrupts_adapter_owned_agents(self):
         adapter = APIServerAdapter(PlatformConfig(enabled=True))
         agent = MagicMock()
@@ -117,6 +129,16 @@ class TestAPIServerAdapterWorkCount:
         assert adapter.interrupt_active_runs("gateway shutdown") == 1
 
         agent.interrupt.assert_called_once_with("gateway shutdown")
+
+    def test_interrupt_active_runs_includes_isolated_bounded_agents(self):
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        agent = MagicMock()
+        adapter._bounded_active_run_agents = {"bounded-1": agent}
+
+        assert adapter.interrupt_active_runs("gateway shutdown") == 1
+
+        agent.interrupt.assert_called_once_with("gateway shutdown")
+        assert "bounded-1" not in adapter._active_run_agents
 
 
 class TestDrainWaitsForApiWork:
