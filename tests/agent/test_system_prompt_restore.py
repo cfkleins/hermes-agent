@@ -27,6 +27,7 @@ def _make_agent(session_db=None, prebuilt_prompt: str = "BUILT_PROMPT"):
     """Construct the minimal agent fake the helper needs."""
     agent = MagicMock()
     agent._cached_system_prompt = None
+    agent._exact_system_prompt = None
     agent.session_id = "test-session-id"
     agent.model = "test-model"
     agent.provider = "openrouter"

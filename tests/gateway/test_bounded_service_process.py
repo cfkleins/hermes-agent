@@ -14,7 +14,7 @@ import pytest
 import psutil
 
 from tests.gateway.test_bounded_service import (
-    ROOT, TOKEN, PROMPT, command, configuration, environment,
+    ROOT, TOKEN, KEY, PROMPT, command, configuration, environment,
 )
 
 
@@ -174,6 +174,50 @@ def test_configured_process_cold_start_restart_and_sigterm_drain(tmp_path):
     assert messages[:2] == [('user', 'first'), ('assistant', 'fixture answer: first')]
     assert messages[-2:] == [('user', 'second'), ('assistant', 'fixture answer: second')]
     assert not list((tmp_path / 'ambient').rglob('*'))
+
+
+def test_live_listener_rejects_same_port_from_different_home(tmp_path):
+    path, _, home = configuration(tmp_path)
+    port = free_port()
+    original, log = start(tmp_path, path, home, port, 'original')
+    competitor_root = tmp_path / 'competitor'
+    competitor_root.mkdir()
+    competitor_home = competitor_root / 'persistent'
+    try:
+        # A different owned home bypasses the home lock, so rejection must
+        # come from the live socket, not from sharing the original's state.
+        with (competitor_root / 'process.log').open('w+', encoding='utf-8') as competitor_log:
+            competitor = subprocess.Popen(
+                command(path, competitor_home, port), cwd=ROOT,
+                env=environment(competitor_root, competitor_home),
+                stdout=competitor_log, stderr=competitor_log)
+            try:
+                assert competitor.wait(timeout=40) == 2
+            finally:
+                stop_process(competitor)
+            competitor_log.seek(0)
+            diagnostic = competitor_log.read()
+        assert 'bounded_service_invalid: OSError' in diagnostic
+        assert 'Traceback' not in diagnostic
+        assert TOKEN not in diagnostic and KEY not in diagnostic
+        # The competitor reached storage setup with its own policy-owned home.
+        assert (competitor_home / 'bounded-service.json').is_file()
+        assert original.poll() is None
+        assert request(port, 'GET', '/v1/bounded-runs/brun_probe', token='wrong')[0] == 401
+        code, accepted = request(port, 'POST', '/v1/bounded-runs', body('still healthy', 'live'))
+        assert code == 202, accepted
+        result = terminal(port, accepted['run_id'])
+        assert result['status'] == 'completed', result
+        assert result['output'] == 'fixture answer: still healthy'
+        assert original.poll() is None
+    finally:
+        kill_if_live(original, log)
+    events = [json.loads(line) for line in (tmp_path / 'fixture.jsonl').read_text().splitlines()]
+    assert [event['event'] for event in events] == ['sdk_request'], events
+    competitor_events = competitor_root / 'fixture.jsonl'
+    assert not competitor_events.exists() or not competitor_events.read_text()
+    assert not list((tmp_path / 'ambient').rglob('*'))
+    assert not list((competitor_root / 'ambient').rglob('*'))
 
 
 @pytest.mark.linux_only

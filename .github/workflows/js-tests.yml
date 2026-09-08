@@ -79,5 +79,7 @@ jobs:
       # ``check:*`` script needs no change here. An empty list is an error and
       # not an empty run, because an empty run reports green after it checks
       # nothing.
+      # The standard fork runner runs one top-level check at a time; each
+      # suite retains its own worker pool and unchanged test deadlines.
       - name: Run all workspace checks
-        run: node .github/scripts/run-workspace-checks.mjs
+        run: node .github/scripts/run-workspace-checks.mjs ${{ github.repository == 'cfkleins/hermes-agent' && '--concurrency 1' || '' }}

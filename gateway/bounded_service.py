@@ -294,7 +294,9 @@ async def serve(service, port, *, stop_file=None):
 
     try:
         await runner.setup()
-        site = web.TCPSite(runner, '127.0.0.1', port, reuse_address=False)
+        # Use asyncio's POSIX TIME_WAIT reuse; Windows keeps address reuse off.
+        # Never share a port with another live listener.
+        site = web.TCPSite(runner, '127.0.0.1', port, reuse_address=None, reuse_port=False)
         await site.start()
         if stop_file is not None:
             check_stop()
