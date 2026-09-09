@@ -143,23 +143,18 @@ def _run_async(coro):
     return _get_tool_loop().run_until_complete(coro)
 
 
-# --- Tool discovery (importing each tools/*.py triggers registry.register) ---
-discover_builtin_tools()
+# The bounded process has no tools or plugins. Import-time discovery would
+# execute ambient code before the exact AIAgent constructor can deny it.
+from hermes_bounded_bootstrap import active as _bounded_process_active
 
-# MCP discovery is deliberately NOT run here: it blocks up to 120 s and the
-# gateway lazy-imports this module inside its event loop; each entry point
-# (gateway/run.py, cli.py, tui_gateway, acp_adapter) runs it at startup.
-try:  # plugin tool discovery (user/project/pip plugins)
-    # MCP tool discovery (external MCP servers from config) used to run here as a module-level side effect.
-    # It was removed because discover_mcp_tools() internally uses a blocking future.result(timeout=120)
-    # wait, and the gateway lazy-imports this module from inside the asyncio event loop on the first user
-    # message — freezing Discord/Telegram heartbeats for up to 120s whenever any configured MCP server was
-    # slow or unreachable (#16856). - gateway/run.py            -> start_gateway() uses run_in_executor -
-    # acp_adapter/server.py     -> asyncio.to_thread on session init
-    from hermes_cli.plugins import discover_plugins
-    discover_plugins()
-except Exception as e:
-    logger.debug("Plugin discovery failed: %s", e)
+if not _bounded_process_active():
+    discover_builtin_tools()
+    # MCP discovery belongs to entrypoints, not this import.
+    try:
+        from hermes_cli.plugins import discover_plugins
+        discover_plugins()
+    except Exception as e:
+        logger.debug("Plugin discovery failed: %s", e)
 
 
 # Backward-compat constants (built once after discovery)
@@ -814,6 +809,9 @@ def handle_function_call(
     it (single-fire contract). enabled/disabled_toolsets scope the Tool Search
     bridge catalog to this session's grant (None = unrestricted).
     """
+    from agent.tool_execution_policy import DENIED_RESULT, tools_denied
+    if tools_denied(None):
+        return DENIED_RESULT
     function_args = coerce_tool_args(function_name, function_args)
     if not isinstance(function_args, dict):
         function_args = {}

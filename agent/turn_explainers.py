@@ -148,6 +148,10 @@ def _display_flag_enabled(agent, *, env_var: str, config_key: str, cache_attr: s
     ``env_var`` overrides on every call and is never cached. Reads the persisted config.yaml
     so gateway and CLI share the setting; ``load_config`` is imported lazily (startup cycle,
     and tests patch it at ``hermes_cli.config``). Any failure → True (safe default: on)."""
+    # Exact bounded turns cannot inherit display transforms or read ambient
+    # environment/configuration while finalizing the admitted exchange.
+    if getattr(agent, "_exact_system_prompt", None) is not None:
+        return False
     try:
         env = os.environ.get(env_var)
         if env is not None:

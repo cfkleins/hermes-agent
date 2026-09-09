@@ -9,6 +9,7 @@ timers run on the shared scheduler thread (``agent/periodic_scheduler.py``), not
 import logging
 import os
 import threading
+import time
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -28,11 +29,12 @@ class DurableTurnLease:
     written only under ``_lock``.
     """
 
-    def __init__(self, agent, db, session_id: str, holder: str) -> None:
+    def __init__(self, agent, db, session_id: str, holder: str, *, lease_key=None) -> None:
         self.agent = agent
         self.db = db
         self.session_id = session_id  # id at admission; release always targets this row
         self.holder = holder
+        self.lease_key = lease_key
         self.stop = threading.Event()
         self.refresh_interval = float(getattr(agent, "_session_turn_lease_refresh_interval", 60.0))
         self._lock = threading.Lock()
@@ -97,7 +99,10 @@ class DurableTurnLease:
         """Release the row and drop the agent's holder attrs (only if they still name this lease)."""
         agent = self.agent
         try:
-            self.db.release_session_turn_lease(self.session_id, self.holder)
+            self.db.release_session_turn_lease(
+                self.session_id, self.holder,
+                **({"lease_key": self.lease_key} if self.lease_key is not None else {}),
+            )
         except Exception:
             logger.error("Failed to release session turn lease: %s", self.session_id, exc_info=True)
         if getattr(agent, "_active_session_turn_lease_holder", None) == self.holder:
@@ -229,9 +234,35 @@ def _durable_session_exists(db, session_id: str) -> bool:
         return True
 
 
+def _read_native_history(db, session_id, holder, lease_key, expected_binding):
+    """Validate actual ownership and load history in one short serialized DB read."""
+    def _read(conn):
+        owned = conn.execute(
+            "SELECT 1 FROM session_turn_leases "
+            "WHERE conversation_id=? AND holder=? AND expires_at>?",
+            (lease_key, holder, time.time()),
+        ).fetchone()
+        if not owned or db._session_turn_lease_key_on_conn(conn, session_id) != lease_key:
+            raise ValueError("Native history lease ownership or acquired domain changed")
+        if db.get_session_binding(session_id) != expected_binding:
+            raise ValueError("Session binding changed or was not authorized before admission")
+        tip = db.resolve_resume_session_id(session_id, strict=True)
+        if not tip or db.get_session(tip) is None:
+            raise ValueError("Native history tip is unavailable")
+        if db._session_turn_lease_key_on_conn(conn, tip) != lease_key:
+            raise ValueError("Native history tip is outside the acquired lease")
+        if db.get_session_binding(tip) != expected_binding:
+            raise ValueError("Native history tip has a different session binding")
+        history = db.get_messages_as_conversation(
+            tip, repair_alternation=True, include_row_ids=True
+        )
+        return tip, history
+    return db._execute_serialized_read(_read)
+
+
 def admit_durable_turn_lease(
     agent, *, session_id: str, relay_turn_id: str, task_context: Dict[str, Any],
-    conversation_history: Optional[List[Dict[str, Any]]],
+    conversation_history: Optional[List[Dict[str, Any]]], expected_binding=None,
 ) -> TurnLeaseAdmission:
     """Acquire the session turn lease when the session is durable; build (not start) its threads.
 
@@ -240,14 +271,23 @@ def admit_durable_turn_lease(
     fails; the caller returns it verbatim."""
     db = getattr(agent, "_session_db", None)
     admission = TurnLeaseAdmission(conversation_history=conversation_history)
+    native_history = getattr(agent, "require_durable_history", False) is True
+    if native_history and (
+        db is None or not session_id or getattr(agent, "_persist_disabled", False)
+        or not callable(getattr(type(db), "acquire_session_turn_lease", None))
+    ):
+        raise ValueError("Native history requires a durable session store")
     if db is None or not session_id:
         return admission
+    session_exists = db.get_session(session_id) is not None if native_history else _durable_session_exists(db, session_id)
+    if native_history and not session_exists:
+        raise ValueError("Native history requires an existing session")
     # A fresh session id has no durable transcript to race over, and callers may supply an
     # in-memory seed before the row exists — reloading would erase it. Check the concrete type:
     # MagicMock-style shims accept any attribute without the protocol.
     if (
         getattr(agent, "_persist_disabled", False)
-        or not _durable_session_exists(db, session_id)
+        or not session_exists
         or not callable(getattr(type(db), "acquire_session_turn_lease", None))
     ):
         return admission
@@ -268,23 +308,29 @@ def admit_durable_turn_lease(
             f"⏳ Still waiting for the other Hermes process on this session ({int(elapsed)}s)..."
         )
 
-    if not db.acquire_session_turn_lease(
+    acquired = db.acquire_session_turn_lease(
         session_id, holder, ttl_seconds=LEASE_TTL_SECONDS, wait_seconds=LEASE_WAIT_SECONDS,
         on_wait=_on_wait, should_abort=lambda: getattr(agent, "_interrupt_requested", False),
-    ):
+        **({"return_key": True} if native_history else {}),
+    )
+    if not acquired:
         admission.early_result = _lease_not_acquired_result(agent, session_id, conversation_history)
         return admission
 
     # Assign only after admission so the finally cannot release a holder that never owned the
     # row; persist paths read the agent attr so a late flush is fenced in the same transaction.
-    lease = DurableTurnLease(agent, db, session_id, holder)
+    lease = DurableTurnLease(agent, db, session_id, holder, lease_key=acquired if native_history else None)
     agent._active_session_turn_lease_holder = holder
     agent._active_session_turn_lease_ttl_seconds = LEASE_TTL_SECONDS
     try:
-        if waited:
+        if native_history:
+            tip, history = _read_native_history(db, session_id, holder, acquired, expected_binding)
+            agent.session_id = tip
+            task_context["session_id"] = tip
+            admission.conversation_history = history
+        elif waited:
             agent._emit_status("Session is free; loading the latest transcript...")
-            # The holder may have compressed/rotated the session while we waited: reload only
-            # AFTER admission; an immediate acquisition skips this (needless prompt-cache miss).
+            # Legacy callers retain their in-memory seed unless acquisition waited.
             latest_session_id = db.resolve_resume_session_id(session_id)
             if latest_session_id:
                 agent.session_id = latest_session_id

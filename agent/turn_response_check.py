@@ -122,6 +122,13 @@ def check_api_response(
 
     response_invalid, error_details = validate_response_shape(agent, response)
     if response_invalid:
+        if getattr(agent, "_exact_system_prompt", None) is not None:
+            logger.warning("Bounded provider response failed closed (invalid response)")
+            return _verdict("return", {
+                "completed": False,
+                "failed": True,
+                "error": "Bounded run failed",
+            })
         _iv = retry_invalid_response(
             agent, response=response, error_details=error_details, _retry=_retry,
             thinking_spinner=thinking_spinner, messages=messages, api_messages=api_messages,
@@ -141,6 +148,17 @@ def check_api_response(
 
     agent._turn_received_provider_response = True
     finish_reason = _derive_finish_reason(agent, response, messages)
+    exact_bounded = getattr(agent, "_exact_system_prompt", None) is not None
+    if exact_bounded and finish_reason != "stop":
+        logger.warning(
+            "Bounded provider response failed closed (finish_reason=%s)",
+            finish_reason,
+        )
+        return _verdict("return", {
+            "completed": False,
+            "failed": True,
+            "error": "Bounded run failed",
+        })
 
     # HTTP-200 refusals are deterministic: one fallback try, else return the refusal.
     if finish_reason == "content_filter":
@@ -194,15 +212,16 @@ def check_api_response(
 
     _retry.has_retried_429 = False
     # Clearing Nous rate-limit state proves the limit reset so other sessions may resume.
-    if agent.provider == "nous":
+    if agent.provider == "nous" and not exact_bounded:
         try:
             from agent.nous_rate_guard import clear_nous_rate_limit
             clear_nous_rate_limit()
         except Exception:
             pass
-    from agent import relay_llm
+    if not exact_bounded:
+        from agent import relay_llm
 
-    relay_llm.complete_logical_call(api_request_id, outcome="success")
+        relay_llm.complete_logical_call(api_request_id, outcome="success")
     agent._touch_activity(f"API call #{api_call_count} completed")
     return _verdict("break")
 

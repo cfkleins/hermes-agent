@@ -40,6 +40,7 @@ from hermes_state_guard import (
 )
 from hermes_state_readpool import _READ_POOL_MAX, _proc_fd_targets, _read_budget_for
 from hermes_state_sessions import SessionSessionsMixin
+from hermes_state_bound_sessions import SessionBoundMixin
 from hermes_state_fts import SessionFtsSetupMixin, load_fts5_cjk_extension
 from hermes_state_portability import SessionPortabilityMixin
 from hermes_state_telegram import SessionTelegramTopicsMixin
@@ -328,7 +329,7 @@ class SessionDB(
     SessionSessionsMixin, SessionFtsSetupMixin, SessionSearchMixin, SessionSchemaMixin,
     SessionPortabilityMixin, SessionTelegramTopicsMixin, SessionCompressionMixin,
     SessionGatewayMixin, SessionMaintenanceMixin, SessionUsageMixin, SessionTitlesMixin,
-    SessionMessagesMixin,
+    SessionMessagesMixin, SessionBoundMixin,
 ):
     """SQLite-backed session storage with FTS5 search; many reader threads, one writer (WAL)."""
 
@@ -422,6 +423,7 @@ class SessionDB(
         _ensure_test_isolation(self.db_path)  # before any connection/pragma/mkdir
         self.read_only = read_only
         self._lock = threading.Lock()
+        self._serialized_reads = threading.local()
         # Read-path split (WAL only): reads borrow from a BOUNDED read-only pool so they
         # never queue behind writer flushes on self._lock (see _read_ctx); unbounded
         # per-thread connections pinned fds for the process lifetime and hit EMFILE.
@@ -715,6 +717,10 @@ class SessionDB(
         connection with NO lock under WAL; otherwise (non-WAL, open failure,
         ceiling reached) the writer connection under self._lock — deliberate
         degradation: slower beats EMFILE, which the supervisor cannot see."""
+        scoped = getattr(getattr(self, "_serialized_reads", None), "conn", None)
+        if scoped is not None:
+            yield scoped
+            return
         conn = self._checkout_read_conn()
         if conn is not None:
             try:
@@ -769,6 +775,22 @@ class SessionDB(
                 f"in flight (a session-teardown path called close() before "
                 f"this worker finished — #94736) and the automatic reopen failed: {exc}"
             ) from exc
+
+    def _execute_serialized_read(self, read):
+        """Read-only callback under BEGIN IMMEDIATE, using one connection for nested reads.
+
+        This short native-admission critical section excludes metadata/lease writers
+        between authorization and transcript loading. Never run inference or writes
+        in the callback. Thread-local pinning also avoids reacquiring the non-reentrant
+        writer lock when the read pool is unavailable. Cleanup covers BaseException.
+        """
+        def _do(conn):
+            self._serialized_reads.conn = conn
+            try:
+                return read(conn)
+            finally:
+                self._serialized_reads.conn = None
+        return self._execute_write(_do)
 
     def _execute_write(
         self, fn: Callable[[sqlite3.Connection], T], patience_s: Optional[float] = None,

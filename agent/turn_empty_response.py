@@ -147,8 +147,6 @@ def recover_empty_response(
     """Recover from a final response with no visible content (see module docstring for
     the ladder). Role alternation is preserved: the post-tool nudge appends the empty
     assistant row BEFORE the user-level hint (APIs reject tool→user)."""
-    from agent.conversation_loop import _EMPTY_TOOL_RESPONSE_NUDGE, _sync_failover_system_message
-
     _turn_exit_reason = turn_exit_reason
     _preflight_compression_blocked = preflight_compression_blocked
 
@@ -158,6 +156,16 @@ def recover_empty_response(
             turn_exit_reason=_turn_exit_reason, active_system_prompt=active_system_prompt,
             preflight_compression_blocked=_preflight_compression_blocked,
         )
+
+    if getattr(agent, "_exact_system_prompt", None) is not None:
+        logger.warning("Bounded provider response failed closed (empty response)")
+        return _verdict("return", {
+            "completed": False,
+            "failed": True,
+            "error": "Bounded run failed",
+        })
+
+    from agent.conversation_loop import _EMPTY_TOOL_RESPONSE_NUDGE, _sync_failover_system_message
 
     # Partial stream recovery: content streamed before the connection died becomes the
     # final response instead of fallback or retries.

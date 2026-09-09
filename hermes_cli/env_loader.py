@@ -316,6 +316,12 @@ def load_hermes_dotenv(
 ) -> list[Path]:
     """Load Hermes env files: ``~/.hermes/.env`` overrides stale shell exports; project ``.env`` is a dev
     fallback that only fills gaps when the user env exists (and overrides shell vars when it does not)."""
+    from hermes_bounded_bootstrap import active as bounded_process_active
+
+    # The dedicated service admits two explicit env secrets, never dotenv or
+    # external secret sources (including the source checkout's project .env).
+    if bounded_process_active():
+        return []
     home_path = Path(hermes_home or os.getenv("HERMES_HOME", Path.home() / ".hermes"))
 
     # Multiplex gateway: while a routed profile-home override is active, copying that profile's .env

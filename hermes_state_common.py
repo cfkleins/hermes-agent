@@ -339,6 +339,18 @@ CREATE TABLE IF NOT EXISTS sessions (
     FOREIGN KEY (system_prompt_hash) REFERENCES system_prompts(hash)
 );
 
+CREATE TABLE IF NOT EXISTS session_bindings (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    owner_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    case_id TEXT NOT NULL,
+    source TEXT NOT NULL,
+    context_digest TEXT NOT NULL,
+    version INTEGER NOT NULL CHECK (version = 1),
+    tool_policy TEXT NOT NULL CHECK (tool_policy = 'deny_all'),
+    UNIQUE (owner_id, agent_id, case_id)
+);
+
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL REFERENCES sessions(id),
